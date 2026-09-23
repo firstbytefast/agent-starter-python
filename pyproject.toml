@@ -12,6 +12,11 @@ dependencies = [
     "livekit-agents>=1.6.1",
     "livekit-plugins-ai-coustics~=0.2",
     "python-dotenv",
+    # src/clutchcall_worker.py, src/outbound.py and src/demo_metrics_agent.py all
+    # `from livekit.plugins import clutchcall`, so the repo could not run from a
+    # plain `uv sync` — only Dockerfile.clutchcall installed it, with the index
+    # passed inline. Declared here, and the index it comes from is below.
+    "livekit-plugins-clutchcall>=0.0.11",
 ]
 
 [dependency-groups]
@@ -25,6 +30,23 @@ dev = [
 # yarl 1.24.1 was published with only a cp310 wheel and no sdist, so it can't
 # install on Python 3.11+. Remove this once upstream uploads the remaining wheels.
 constraint-dependencies = ["yarl<1.24"]
+
+# livekit-plugins-clutchcall is published to ClutchCall's own index, not PyPI.
+#
+# It goes HERE rather than in a pip.conf: a project-local pip.conf is not read
+# by anything — pip only reads ~/.pip/pip.conf, /etc/pip.conf or
+# PIP_CONFIG_FILE — so a committed one would look like configuration and do
+# nothing. This repo resolves with uv (`uv sync` in taskfile.yaml), and this is
+# the setting uv reads.
+#
+# default = false keeps PyPI as the primary index: every public dependency
+# still comes from PyPI, and only our own package is looked up here. Making it
+# the default would silently route the whole dependency tree through our
+# origin, which is neither intended nor something it is built to serve.
+[[tool.uv.index]]
+name = "clutchcall"
+url = "https://artifacts.clutchcall.dev/pip/simple/"
+default = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
