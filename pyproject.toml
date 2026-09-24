@@ -55,6 +55,10 @@ where = ["src"]
 "" = "src"
 
 [tool.pytest.ini_options]
+# The TeleQuick mirror under .mirror/ is this tree run through a sed pass, so
+# its tests are the same tests. pytest ignores .gitignore and would collect
+# them, doubling every count and hiding which brand actually failed.
+testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

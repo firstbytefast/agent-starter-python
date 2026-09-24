@@ -32,6 +32,13 @@ log = logging.getLogger("demo-agent")
 from livekit.agents import Agent, AgentSession, RunContext, function_tool
 from livekit.plugins import clutchcall, deepgram, openai, silero
 
+from call_stats import CallStats
+from thinking_audio import start_thinking_sound
+
+LLM_MODEL = "gpt-4.1-mini"
+STT_MODEL = "nova-2-phonecall"
+TTS_MODEL = "gpt-4o-mini-tts"
+
 _vad = None
 
 
@@ -60,7 +67,7 @@ class DemoAgent(Agent):
         env = meta.get("env", "unknown")
         team = meta.get("team", "unknown")
         super().__init__(
-            llm=openai.LLM(model="gpt-4.1-mini"),
+            llm=openai.LLM(model=LLM_MODEL),
             instructions=(
                 "You are a brief, friendly order-status assistant answering a phone call. "
                 f"Your deployment context is env={env}, team={team} — mention the env once "
@@ -94,48 +101,36 @@ async def entrypoint(ctx) -> None:
     log.info("call start: room=%s metadata=%s", getattr(ctx.room, "name", "?"), meta)
 
     session = AgentSession(
-        stt=deepgram.STT(model="nova-2-phonecall"),
-        llm=openai.LLM(model="gpt-4.1-mini"),
+        stt=deepgram.STT(model=STT_MODEL),
+        llm=openai.LLM(model=LLM_MODEL),
         # Name the model. `openai.TTS(voice=...)` defaults to tts-1, which
         # measured ttfb 2230 ms against gpt-4o-mini-tts at 895 ms on the same
         # text and network — about 1.3 s of extra silence on every turn.
         # Fixed in agent.py by 8d88a81; this second pipeline kept the default.
-        tts=openai.TTS(model="gpt-4o-mini-tts", voice="alloy"),
+        tts=openai.TTS(model=TTS_MODEL, voice="alloy"),
         vad=_get_vad(),
     )
 
-    # Per-stage usage → ClutchCall. livekit-agents emits these on our own
-    # provider keys; forwarding them gives the platform token analytics.
-    @session.on("metrics_collected")
-    def _on_metrics(ev) -> None:  # noqa: ANN001
-        conn = clutchcall.current_connection()
-        cid = clutchcall.current_call_id()
-        if conn is None or cid is None:
-            return
-        m = getattr(ev, "metrics", ev)
-        kind = type(m).__name__
-        g = lambda a, d=0: getattr(m, a, d) or d  # noqa: E731
-        try:
-            if "LLM" in kind:
-                conn.send_usage(cid, "llm",
-                                {"prompt_tokens": int(g("prompt_tokens")),
-                                 "completion_tokens": int(g("completion_tokens"))},
-                                provider="openai", model="gpt-4.1-mini")
-            elif "STT" in kind:
-                conn.send_usage(cid, "stt",
-                                {"audio_seconds": float(g("audio_duration"))},
-                                provider="deepgram", model="nova-2-phonecall")
-            elif "TTS" in kind:
-                conn.send_usage(cid, "tts",
-                                {"characters": int(g("characters_count"))},
-                                provider="openai", model="tts-1")
-            else:
-                return
-            log.info("reported %s usage -> ClutchCall", kind)
-        except Exception:  # noqa: BLE001
-            log.exception("usage report failed")
+    # Per-stage usage → ClutchCall, and the same numbers on the console.
+    # livekit-agents emits them on our own provider keys; forwarding them gives
+    # the platform token analytics, and printing them gives the operator a
+    # per-turn view of where the latency went.
+    stats = CallStats(
+        models={"llm": LLM_MODEL, "stt": STT_MODEL, "tts": TTS_MODEL},
+        providers={"llm": "openai", "stt": "deepgram", "tts": "openai"},
+        log=log,
+    )
+    stats.attach(session)
+    ctx.add_shutdown_callback(stats.log_summary)
 
     await session.start(agent=DemoAgent(meta), room=ctx.room)
+
+    # Filler audio over the same QUIC lane while the LLM thinks — the caller
+    # hears that the agent is still there instead of dead air.
+    thinking = await start_thinking_sound(ctx, session)
+    if thinking is not None:
+        ctx.add_shutdown_callback(thinking.aclose)
+
     await session.generate_reply(
         instructions="Greet the caller in one short sentence and ask how you can help.",
     )

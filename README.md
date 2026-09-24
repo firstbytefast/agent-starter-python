@@ -135,6 +135,73 @@ calls dispatched to it (route a DID to the agent with a ClutchCall
 external-agent config). The transport plugin is published at
 `https://artifacts.clutchcall.dev/pip/simple/` as `livekit-plugins-clutchcall`.
 
+## Thinking sound and call stats
+
+The agent plays a sound while the LLM thinks, and prints what each turn used.
+Two files do this, and both work on LiveKit and over ClutchCall:
+
+- `src/thinking_audio.py` — fills the dead air between the end of the caller's
+  sentence and the first byte of the reply. A caller cannot see a spinner, and
+  silence on a phone line sounds like a dropped call.
+- `src/call_stats.py` — prints one line for each turn, and a summary at the end
+  of the call.
+
+The two transports need two different players, and
+`start_thinking_sound(ctx, session)` selects the correct one:
+
+| Transport | Player | How it plays |
+|-----------|--------|--------------|
+| LiveKit room | the SDK `BackgroundAudioPlayer` | publishes a second audio track and mixes the clips into it |
+| ClutchCall QUIC | `TransportThinkingAudio` | writes 20 ms frames on the caller's audio lane, because the call has only one lane and no room |
+
+The sound starts 400 ms after the agent enters the `thinking` state, so a fast
+turn stays silent. The default sound is synthesized, and the repo holds no audio
+file. To use your own sound, set `CC_THINKING_WAV` to the path of a mono 16-bit
+WAV file:
+
+```console
+docker run -d --name cc-starter-agent \
+  -e CC_THINKING_WAV=/app/sounds/hold.wav \
+  ... \
+  cc-starter-agent
+```
+
+`CallStats` reads the `metrics_collected` events that livekit-agents emits for
+each stage. It prints one line for each turn while the call runs:
+
+```
+turn 3 | eou 180 ms · llm ttft 420 ms (312→48 tok) · tts ttfb 890 ms (96 ch) | caller waited 1490 ms
+```
+
+At the end of the call it prints the totals:
+
+```
+──── call summary ────
+turns        7
+llm  gpt-4.1-mini     4210 prompt (1024 cached) + 512 completion = 4722 tokens over 7 requests
+stt  nova-3           61.4 s audio
+tts  gpt-4o-mini-tts  742 characters → 48.1 s audio over 9 requests
+latency p50/p95  eou 170/240 ms · ttft 402/780 ms · ttfb 830/1210 ms
+```
+
+Over ClutchCall the same numbers also go to the engine (`send_usage`), so the
+token counts land on the call timeline and in ClickHouse next to the CDR. On
+LiveKit that step does nothing. Telemetry never stops a call: a bad metric, a
+missing field, or a failed report is logged and dropped.
+
+To test these two files, run `uv run pytest tests/test_call_stats.py
+tests/test_thinking_audio.py`. The tests use fake metric objects and a fake
+transport, so they need no models, no network, and no call.
+
+### TeleQuick mirror
+
+This tree is CANONICAL for both brands. `./mirror-telequick.sh` writes the
+TeleQuick-branded copy to `.mirror/telequick/` — plugin name
+(`livekit-plugins-telequick`), python module, engine host, env prefixes and file
+names all rewritten in one mechanical pass. The mirror is generated and
+gitignored: make every change here and re-run the script. The package origin
+`artifacts.clutchcall.dev` is protected, because one origin serves both brands.
+
 ### Outbound calling (single + batch)
 
 The same worker also serves calls the platform dials OUT — the engine places
