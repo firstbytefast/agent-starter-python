@@ -1,5 +1,5 @@
-# Run the starter agent over ClutchCall QUIC transport (no LiveKit server).
-# Build:  docker build -f Dockerfile.clutchcall -t cc-starter-agent .
+# Run the starter agent over TeleQuick QUIC transport (no LiveKit server).
+# Build:  docker build -f Dockerfile.telequick -t cc-starter-agent .
 # Run:    docker run -d --name cc-starter-agent \
 #           -e CC_APP_KEY=... -e CC_SECRET=... -e CC_AGENT=salesbot \
 #           -e OPENAI_API_KEY=... -e DEEPGRAM_API_KEY=... \
@@ -12,9 +12,9 @@ RUN pip install --no-cache-dir \
         "livekit-agents[deepgram,openai,silero]~=1.6" \
         aioquic \
         python-dotenv \
-    && pip install --no-cache-dir livekit-plugins-clutchcall \
+    && pip install --no-cache-dir livekit-plugins-telequick \
         --extra-index-url https://artifacts.clutchcall.dev/pip/simple/
 
 COPY src/ ./src/
 
-CMD ["python", "src/clutchcall_worker.py"]
+CMD ["python", "src/telequick_worker.py"]
