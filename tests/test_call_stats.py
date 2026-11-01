@@ -241,14 +241,42 @@ def test_realtime_metric_sends_a_realtime_turn(cc_conn) -> None:
     assert f["latency_ms"] == pytest.approx(700)
 
 
+def test_user_speech_is_sent_on_each_edge_once(cc_conn) -> None:
+    _, session = _fwd_stats()
+    session.emit("user_state_changed", _StateEvent("listening"))  # no edge yet
+    session.emit("user_state_changed", _StateEvent("speaking"))
+    session.emit("user_state_changed", _StateEvent("speaking"))  # repeat
+    session.emit("user_state_changed", _StateEvent("listening"))
+    session.emit("user_state_changed", _StateEvent("away"))  # still not speaking
+    session.emit("user_state_changed", _StateEvent("speaking"))
+    session.emit("user_state_changed", _StateEvent("away"))
+
+    assert _marks(cc_conn, "user_speech") == [
+        ("user_speech", 42, True),
+        ("user_speech", 42, False),
+        ("user_speech", 42, True),
+        ("user_speech", 42, False),
+    ]
+
+
+def test_user_speech_is_skipped_on_an_older_plugin(cc_conn, monkeypatch) -> None:
+    monkeypatch.delattr(type(cc_conn), "send_user_speech")
+    stats, session = _fwd_stats()
+    session.emit("user_state_changed", _StateEvent("speaking"))
+    session.emit("user_state_changed", _StateEvent("listening"))
+    assert _marks(cc_conn, "user_speech") == []
+
+
 def test_a_failing_connection_does_not_raise_into_the_call(cc_conn) -> None:
     def boom(*a, **k):
         raise RuntimeError("stream closed")
 
     cc_conn.send_turn = boom
     cc_conn.send_reply_start = boom
+    cc_conn.send_user_speech = boom
     stats, session = _fwd_stats()
     session.emit("agent_state_changed", _StateEvent("speaking"))
+    session.emit("user_state_changed", _StateEvent("speaking"))
     _turn(session, "s1", prompt=1, completion=1, chars=1)
     assert stats.totals.turns == 1
 

@@ -21,6 +21,9 @@ class FakeConn:
     def send_filler(self, cid, on) -> None:
         self.sent.append(("filler", cid, on))
 
+    def send_user_speech(self, cid, on) -> None:
+        self.sent.append(("user_speech", cid, on))
+
     def send_turn(self, cid, **fields) -> None:
         self.sent.append(("turn", cid, fields))
 

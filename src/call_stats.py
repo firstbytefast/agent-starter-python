@@ -16,7 +16,9 @@ CDR — that path is best-effort and never raises into the call.
 Two more marks go to the engine so it can build an `agent.turn` span for each
 user turn: `reply_start` (the agent state goes to "speaking") and one `turn`
 message with the latency of the turn. The greeting has no end-of-turn metric, so
-it sends no `turn`. These are best-effort too.
+it sends no `turn`. A third mark, `user_speech`, tells the engine when the caller
+starts and stops speaking (the user state goes to or leaves "speaking"). These
+are best-effort too.
 
 Attribute names on the metric objects differ slightly across SDK versions, so
 every read goes through `_get` with a default. A missing field shows as 0, not
@@ -111,12 +113,22 @@ class CallStats:
         self._session = None
         self._user_turns = 0  # 1-based index of the `turn` messages sent
         self._reply_started_for: str | None = None
+        self._user_speaking = False  # last user_speech state sent
 
     # -- wiring -----------------------------------------------------------
     def attach(self, session) -> None:  # AgentSession
         self._session = session
         session.on("metrics_collected", self._on_metrics)
         session.on("agent_state_changed", self._on_state)
+        session.on("user_state_changed", self._on_user_state)
+
+    def _on_user_state(self, ev) -> None:  # UserStateChangedEvent
+        speaking = getattr(ev, "new_state", None) == "speaking"
+        # One message per edge: "listening" -> "away" is not a new edge.
+        if speaking == self._user_speaking:
+            return
+        self._user_speaking = speaking
+        self._forward_call("send_user_speech", speaking)
 
     def _on_state(self, ev) -> None:  # AgentStateChangedEvent
         if getattr(ev, "new_state", None) != "speaking":
