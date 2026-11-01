@@ -117,3 +117,49 @@ async def test_a_failing_transport_does_not_raise_into_the_call() -> None:
     player.start()
     await asyncio.sleep(0.06)
     await player.aclose()  # the task swallowed it; closing is still clean
+
+
+@pytest.mark.asyncio
+async def test_filler_on_and_off_are_reported_to_the_engine(cc_conn) -> None:
+    transport = _FakeTransport()
+    player = _player(transport)
+    session = _Session()
+    player.attach(session)
+
+    session.emit("agent_state_changed", _StateEvent("thinking"))
+    await asyncio.sleep(0.08)
+    assert cc_conn.sent == [("filler", 42, True)]  # once, not once per frame
+
+    session.emit("agent_state_changed", _StateEvent("speaking"))
+    await asyncio.sleep(0.04)
+    assert cc_conn.sent == [("filler", 42, True), ("filler", 42, False)]
+    await player.aclose()
+
+
+@pytest.mark.asyncio
+async def test_no_filler_report_when_it_never_started(cc_conn) -> None:
+    transport = _FakeTransport()
+    player = TransportThinkingAudio(transport, sample_rate=8000, delay=0.5)
+    session = _Session()
+    player.attach(session)
+
+    session.emit("agent_state_changed", _StateEvent("thinking"))
+    await asyncio.sleep(0.03)
+    session.emit("agent_state_changed", _StateEvent("speaking"))  # fast turn
+    await asyncio.sleep(0.03)
+    assert cc_conn.sent == []
+    await player.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_filler_report_does_not_stop_the_filler(cc_conn) -> None:
+    def boom(*a, **k):
+        raise RuntimeError("stream closed")
+
+    cc_conn.send_filler = boom
+    transport = _FakeTransport()
+    player = _player(transport)
+    player.start()
+    await asyncio.sleep(0.08)
+    await player.aclose()
+    assert transport.frames

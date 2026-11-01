@@ -189,6 +189,20 @@ token counts land on the call timeline and in ClickHouse next to the CDR. On
 LiveKit that step does nothing. Telemetry never stops a call: a bad metric, a
 missing field, or a failed report is logged and dropped.
 
+Over ClutchCall the agent also sends three timing messages to the engine. The
+engine uses them to build an `agent.turn` trace span for each caller turn:
+
+- `reply_start` — the agent starts to speak. `CallStats` sends it once for each
+  speech.
+- `turn` — the latency of one caller turn: end-of-turn delay, LLM first token,
+  TTS first byte, and the total wait. `CallStats` sends it for each caller turn.
+  The greeting has no end-of-turn metric, so it sends no `turn`.
+- `filler` — the thinking sound started or stopped. `TransportThinkingAudio`
+  sends `on` at the first filler frame, and `off` only if the sound started.
+  A fast turn that stays silent sends nothing.
+
+An older engine ignores these messages.
+
 To test these two files, run `uv run pytest tests/test_call_stats.py
 tests/test_thinking_audio.py`. The tests use fake metric objects and a fake
 transport, so they need no models, no network, and no call.

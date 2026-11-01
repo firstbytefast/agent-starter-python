@@ -118,6 +118,11 @@ class TransportThinkingAudio:
     report in the queue that the next real flush would read as its own. Pacing
     one frame per tick is what makes that safe — when the LLM answers, at most
     one 20 ms frame of filler is still in flight ahead of the reply.
+
+    The engine is told when the filler ACTUALLY starts (the first frame, after
+    the delay) and when it stops, so its `agent.turn` span can show the gap the
+    caller heard as filler. A fast turn that never reaches the delay reports
+    nothing. The report is best-effort and never raises into the call.
     """
 
     def __init__(
@@ -138,6 +143,7 @@ class TransportThinkingAudio:
         self._clip = load_clip(sample_rate, volume=volume)
         self._task: asyncio.Task | None = None
         self._closed = False
+        self._conn = None  # (connection, call_id) taken when the filler starts
 
     def attach(self, session) -> None:  # AgentSession
         session.on("agent_state_changed", self._on_state)
@@ -152,6 +158,7 @@ class TransportThinkingAudio:
     def start(self) -> None:
         if self._closed or (self._task is not None and not self._task.done()):
             return
+        self._conn = self._call_connection()
         self._task = asyncio.ensure_future(self._play())
 
     def stop(self) -> None:
@@ -163,7 +170,34 @@ class TransportThinkingAudio:
         self._closed = True
         self.stop()
 
+    @staticmethod
+    def _call_connection():
+        """(connection, call_id) of the call being served, or None."""
+        try:
+            from livekit.plugins import clutchcall
+
+            conn = clutchcall.current_connection()
+            cid = clutchcall.current_call_id()
+        except Exception:  # not installed, or outside a call
+            return None
+        if conn is None or cid is None:
+            return None
+        return conn, cid
+
+    def _report(self, on: bool) -> None:
+        if self._conn is None:
+            return
+        conn, cid = self._conn
+        send = getattr(conn, "send_filler", None)
+        if send is None:
+            return  # an older plugin wheel without this message
+        try:
+            send(cid, on)
+        except Exception:  # reporting must never break the call
+            logger.exception("thinking audio: filler report failed")
+
     async def _play(self) -> None:
+        started = False
         try:
             await asyncio.sleep(self._delay)
             loop = asyncio.get_running_loop()
@@ -172,6 +206,9 @@ class TransportThinkingAudio:
             frame_bytes = self._spf * 2
             clip = self._clip.tobytes()
             while not self._closed:
+                if not started:
+                    started = True
+                    self._report(True)
                 # Sleep to an absolute deadline, not a fixed 20 ms: a fixed
                 # sleep drifts late by however long each send took, and the
                 # filler would then arrive slower than real time.
@@ -194,6 +231,9 @@ class TransportThinkingAudio:
             pass
         except Exception:  # filler must never end a call
             logger.exception("thinking audio: playback stopped")
+        finally:
+            if started:
+                self._report(False)  # only if it had started
 
 
 class _RoomThinkingAudio:

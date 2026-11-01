@@ -13,6 +13,11 @@ agent runs over ClutchCall, the same numbers are ALSO forwarded to the engine
 (`send_usage`), so they land on the call timeline and in ClickHouse next to the
 CDR — that path is best-effort and never raises into the call.
 
+Two more marks go to the engine so it can build an `agent.turn` span for each
+user turn: `reply_start` (the agent state goes to "speaking") and one `turn`
+message with the latency of the turn. The greeting has no end-of-turn metric, so
+it sends no `turn`. These are best-effort too.
+
 Attribute names on the metric objects differ slightly across SDK versions, so
 every read goes through `_get` with a default. A missing field shows as 0, not
 as a crashed call.
@@ -56,6 +61,12 @@ class _Turn:
     cached_tokens: int = 0
     completion_tokens: int = 0
     characters: int = 0
+    has_eou: bool = False  # the greeting has no EOU metric: it is not a user turn
+    transcription_delay: float = 0.0
+    llm_duration: float = 0.0
+    llm_provider: str = ""
+    llm_model: str = ""
+    tts_provider: str = ""
 
 
 @dataclass
@@ -97,10 +108,30 @@ class CallStats:
         self._log = log or logger
         self.totals = Totals()
         self._open: dict[str, _Turn] = {}
+        self._session = None
+        self._user_turns = 0  # 1-based index of the `turn` messages sent
+        self._reply_started_for: str | None = None
 
     # -- wiring -----------------------------------------------------------
     def attach(self, session) -> None:  # AgentSession
+        self._session = session
         session.on("metrics_collected", self._on_metrics)
+        session.on("agent_state_changed", self._on_state)
+
+    def _on_state(self, ev) -> None:  # AgentStateChangedEvent
+        if getattr(ev, "new_state", None) != "speaking":
+            return
+        try:
+            speech = getattr(self._session, "current_speech", None)
+            speech_id = getattr(speech, "id", None) or None
+            # One mark per speech: the state can return to "speaking" inside it.
+            if speech_id is not None:
+                if speech_id == self._reply_started_for:
+                    return
+                self._reply_started_for = speech_id
+            self._forward_call("send_reply_start", speech_id=speech_id)
+        except Exception:  # telemetry never breaks a call
+            self._log.exception("stats: reply_start failed")
 
     # -- the metrics stream ----------------------------------------------
     def _on_metrics(self, ev) -> None:  # MetricsCollectedEvent
@@ -109,6 +140,8 @@ class CallStats:
         try:
             if "EOU" in kind:
                 self._on_eou(m)
+            elif "Realtime" in kind:
+                self._on_realtime(m)
             elif "LLM" in kind:
                 self._on_llm(m)
             elif "TTS" in kind:
@@ -124,12 +157,17 @@ class CallStats:
 
     def _on_eou(self, m: object) -> None:
         delay = _get(m, "end_of_utterance_delay")
-        self._turn(m).eou_delay = delay
+        turn = self._turn(m)
+        turn.eou_delay = delay
+        turn.has_eou = True
+        turn.transcription_delay = _get(m, "transcription_delay")
         self.totals.eou_delays.append(delay)
 
     def _on_llm(self, m: object) -> None:
         turn = self._turn(m)
         turn.ttft = _get(m, "ttft")
+        turn.llm_duration = _get(m, "duration")
+        turn.llm_provider, turn.llm_model = self._labels("llm", m)
         turn.prompt_tokens = int(_get(m, "prompt_tokens"))
         turn.cached_tokens = int(_get(m, "prompt_cached_tokens"))
         turn.completion_tokens = int(_get(m, "completion_tokens"))
@@ -154,6 +192,7 @@ class CallStats:
     def _on_tts(self, m: object) -> None:
         turn = self._turn(m)
         turn.ttfb = _get(m, "ttfb")
+        turn.tts_provider, _ = self._labels("tts", m)
         turn.characters = int(_get(m, "characters_count"))
 
         t = self.totals
@@ -172,6 +211,26 @@ class CallStats:
         if done is not None:
             t.turns += 1
             self._log_turn(t.turns, done)
+            if done.has_eou:
+                self._send_turn(key, done)
+
+    def _on_realtime(self, m: object) -> None:
+        # A realtime model has no separate STT/LLM/TTS stages: time to first
+        # audio byte is the whole wait. The metric may carry no speech id.
+        ttfa = _get(m, "ttft") * 1000
+        provider, model = self._labels("realtime", m)
+        speech_id = getattr(m, "speech_id", None) or None
+        self._user_turns += 1
+        self._forward_call(
+            "send_turn",
+            speech_id=speech_id,
+            index=self._user_turns,
+            mode="realtime",
+            latency_ms=ttfa,
+            rt_ttfa_ms=ttfa,
+            realtime_provider=provider or None,
+            realtime_model=model or None,
+        )
 
     def _on_stt(self, m: object) -> None:
         self.totals.stt_audio_s += _get(m, "audio_duration")
@@ -195,6 +254,27 @@ class CallStats:
             turn.ttfb * 1000,
             turn.characters,
             reply * 1000,
+        )
+
+    def _send_turn(self, key: str, turn: _Turn) -> None:
+        self._user_turns += 1
+        stt_provider = self._providers.get("stt", "")
+        self._forward_call(
+            "send_turn",
+            speech_id=None if key == "-" else key,
+            index=self._user_turns,
+            mode="pipeline",
+            # What the caller waited: the same sum the console line prints.
+            latency_ms=(turn.eou_delay + turn.ttft + turn.ttfb) * 1000,
+            endpointing_ms=turn.eou_delay * 1000,
+            asr_ms=turn.transcription_delay * 1000 or None,
+            llm_ttft_ms=turn.ttft * 1000,
+            llm_ms=turn.llm_duration * 1000 or None,
+            tts_ttfb_ms=turn.ttfb * 1000,
+            llm_provider=turn.llm_provider or None,
+            llm_model=turn.llm_model or None,
+            asr_provider=stt_provider or None,
+            tts_provider=turn.tts_provider or None,
         )
 
     def summary_lines(self) -> list[str]:
@@ -222,7 +302,19 @@ class CallStats:
             self._log.info(line)
 
     # -- ClutchCall forwarding (no-op off the ClutchCall transport) -------
-    def _send_usage(self, stage: str, amounts: dict, m: object) -> None:
+    def _labels(self, stage: str, m: object) -> tuple[str, str]:
+        """(provider, model) from the metric's metadata, else the fallbacks."""
+        meta = getattr(m, "metadata", None)
+        model = getattr(meta, "model_name", None) or self._models.get(stage, "")
+        provider = getattr(meta, "model_provider", None) or self._providers.get(
+            stage, ""
+        )
+        return provider, model
+
+    def _forward_call(self, method: str, *args, **kwargs) -> None:
+        """Call `method` on the ClutchCall connection with this call's id.
+
+        Does nothing on a LiveKit room, and never raises into the call."""
         if not self._forward:
             return
         try:
@@ -234,12 +326,16 @@ class CallStats:
         cid = clutchcall.current_call_id()
         if conn is None or cid is None:
             return  # running on a LiveKit room, not over ClutchCall
-        meta = getattr(m, "metadata", None)
-        model = getattr(meta, "model_name", None) or self._models.get(stage, "")
-        provider = getattr(meta, "model_provider", None) or self._providers.get(
-            stage, ""
-        )
+        send = getattr(conn, method, None)
+        if send is None:
+            return  # an older plugin wheel without this message
         try:
-            conn.send_usage(cid, stage, amounts, provider=provider, model=model)
+            send(cid, *args, **kwargs)
         except Exception:  # reporting must never break the call
-            self._log.exception("stats: %s usage report failed", stage)
+            self._log.exception("stats: %s failed", method)
+
+    def _send_usage(self, stage: str, amounts: dict, m: object) -> None:
+        provider, model = self._labels(stage, m)
+        self._forward_call(
+            "send_usage", stage, amounts, provider=provider, model=model
+        )
